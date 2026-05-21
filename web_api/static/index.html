@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trading Bot Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen" x-data="dashboardApp()" x-init="init()">
+  <div class="max-w-7xl mx-auto px-4 py-6">
+    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6">
+      <h1 class="text-2xl font-bold tracking-tight">Trading Bot Dashboard</h1>
+      <div class="flex items-center gap-3">
+        <span class="text-sm text-slate-400">Auto refresh: 5s</span>
+        <span class="px-3 py-1 rounded-full text-xs font-semibold"
+              :class="state.mode === 'paper' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'"
+              x-text="(state.mode || 'unknown').toUpperCase()"></span>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-6">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="text-slate-400 text-sm">Cash</div>
+        <div class="text-xl font-semibold mt-1" x-text="formatGBP(state.cash)"></div>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="text-slate-400 text-sm">Portfolio Value</div>
+        <div class="text-xl font-semibold mt-1" x-text="formatGBP(state.portfolio_value)"></div>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="text-slate-400 text-sm">Today P&amp;L</div>
+        <div class="text-xl font-semibold mt-1" :class="state.today_pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="formatGBP(state.today_pnl)"></div>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="text-slate-400 text-sm">Win Rate</div>
+        <div class="text-xl font-semibold mt-1" x-text="formatPercent(winRate)"></div>
+      </div>
+    </div>
+
+    <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 mb-6">
+      <h2 class="text-lg font-semibold mb-3">Equity Curve</h2>
+      <div class="relative h-64">
+        <canvas id="equityChart" class="w-full h-full"></canvas>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 overflow-x-auto">
+        <h2 class="text-lg font-semibold mb-3">Positions</h2>
+        <table class="min-w-full text-sm">
+          <thead>
+            <tr class="text-left text-slate-400 border-b border-slate-800">
+              <th class="py-2">Ticker</th>
+              <th class="py-2">Shares</th>
+              <th class="py-2">Avg Cost</th>
+              <th class="py-2">Current</th>
+              <th class="py-2">P&amp;L</th>
+              <th class="py-2">P&amp;L%</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="row in positions" :key="row.ticker">
+              <tr class="border-b border-slate-800/50">
+                <td class="py-2" x-text="row.ticker"></td>
+                <td class="py-2" x-text="Number(row.shares || 0).toFixed(6)"></td>
+                <td class="py-2" x-text="formatGBP(row.avg_cost)"></td>
+                <td class="py-2" x-text="formatGBP(row.current_price)"></td>
+                <td class="py-2" :class="row.pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="formatGBP(row.pnl)"></td>
+                <td class="py-2" :class="row.pnl_percent >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="formatPercent(row.pnl_percent)"></td>
+              </tr>
+            </template>
+            <tr x-show="positions.length === 0"><td class="py-3 text-slate-500" colspan="6">No open positions</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="space-y-6">
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 overflow-x-auto">
+          <h2 class="text-lg font-semibold mb-3">Recent Trades</h2>
+          <table class="min-w-full text-sm">
+            <thead>
+              <tr class="text-left text-slate-400 border-b border-slate-800">
+                <th class="py-2">Timestamp</th>
+                <th class="py-2">Ticker</th>
+                <th class="py-2">Action</th>
+                <th class="py-2">Shares</th>
+                <th class="py-2">Price</th>
+                <th class="py-2">P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="trade in trades" :key="trade.timestamp + trade.ticker + trade.action">
+                <tr class="border-b border-slate-800/50">
+                  <td class="py-2" x-text="formatTime(trade.timestamp)"></td>
+                  <td class="py-2" x-text="trade.ticker"></td>
+                  <td class="py-2" :class="trade.action === 'BUY' ? 'text-emerald-300' : 'text-amber-300'" x-text="trade.action"></td>
+                  <td class="py-2" x-text="Number(trade.shares || 0).toFixed(6)"></td>
+                  <td class="py-2" x-text="formatGBP(trade.price)"></td>
+                  <td class="py-2" :class="(trade.pnl || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="formatGBP(trade.pnl || 0)"></td>
+                </tr>
+              </template>
+              <tr x-show="trades.length === 0"><td class="py-3 text-slate-500" colspan="6">No trades found</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 overflow-x-auto">
+          <h2 class="text-lg font-semibold mb-3">Cycle Log</h2>
+          <table class="min-w-full text-sm">
+            <thead>
+              <tr class="text-left text-slate-400 border-b border-slate-800">
+                <th class="py-2">Timestamp</th>
+                <th class="py-2">Orders Executed</th>
+                <th class="py-2">Cash After</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="cycle in cycleHistory" :key="cycle.timestamp">
+                <tr class="border-b border-slate-800/50">
+                  <td class="py-2" x-text="formatTime(cycle.timestamp)"></td>
+                  <td class="py-2" x-text="cycle.orders_executed"></td>
+                  <td class="py-2" x-text="formatGBP(cycle.free_cash)"></td>
+                </tr>
+              </template>
+              <tr x-show="cycleHistory.length === 0"><td class="py-3 text-slate-500" colspan="3">No cycle data</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function dashboardApp() {
+      return {
+        state: {},
+        positions: [],
+        trades: [],
+        cycleHistory: [],
+        winRate: 0,
+        chart: null,
+
+        async init() {
+          await this.refresh();
+          setInterval(() => this.refresh(), 5000);
+        },
+
+        async refresh() {
+          const [state, positions, trades, equity, cycleHistory] = await Promise.all([
+            fetch('/api/state').then(r => r.json()),
+            fetch('/api/positions').then(r => r.json()),
+            fetch('/api/trades?limit=50').then(r => r.json()),
+            fetch('/api/equity_history').then(r => r.json()),
+            fetch('/api/cycle_history').then(r => r.json()),
+          ]);
+
+          this.state = state || {};
+          this.positions = positions || [];
+          this.trades = trades || [];
+          this.cycleHistory = cycleHistory || [];
+          this.computeWinRate();
+          this.renderChart(equity || { timestamps: [], values: [] });
+        },
+
+        computeWinRate() {
+          const sells = this.trades.filter(t => t.action === 'SELL');
+          if (sells.length === 0) {
+            this.winRate = 0;
+            return;
+          }
+          const wins = sells.filter(t => (t.pnl || 0) > 0).length;
+          this.winRate = (wins / sells.length) * 100;
+        },
+
+        renderChart(equity) {
+          const ctx = document.getElementById('equityChart');
+          if (!ctx) return;
+
+          const labels = (equity.timestamps || []).map(ts => this.formatTime(ts));
+          const values = equity.values || [];
+
+          if (this.chart) {
+            this.chart.data.labels = labels;
+            this.chart.data.datasets[0].data = values;
+            this.chart.update();
+            return;
+          }
+
+          this.chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels,
+              datasets: [{
+                label: 'Portfolio Value',
+                data: values,
+                borderColor: '#22c55e',
+                backgroundColor: 'rgba(34, 197, 94, 0.2)',
+                tension: 0.25,
+                fill: true
+              }]
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              scales: {
+                x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148, 163, 184, 0.15)' } },
+                y: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148, 163, 184, 0.15)' } },
+              },
+              plugins: {
+                legend: { labels: { color: '#cbd5e1' } }
+              }
+            }
+          });
+        },
+
+        formatGBP(v) {
+          const value = Number(v || 0);
+          return `£${value.toFixed(2)}`;
+        },
+
+        formatPercent(v) {
+          const value = Number(v || 0);
+          return `${value.toFixed(2)}%`;
+        },
+
+        formatTime(ts) {
+          if (!ts) return '-';
+          const d = new Date(ts);
+          if (Number.isNaN(d.getTime())) return ts;
+          return d.toLocaleString();
+        }
+      }
+    }
+  </script>
+</body>
+</html>

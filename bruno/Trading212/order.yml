@@ -1,0 +1,18 @@
+info:
+  name: order
+  type: http
+  seq: 1
+
+http:
+  method: get
+  url: https://live.trading212.com/api/v0/equity/account/summary
+  auth:
+    type: basic
+    username: 20521271ZWkpwrpxPLQREOPxqCPHEtSximMqO
+    password: H1FcKFg0ANulnvAk0ujVOlqcP8UBjtoNm8zWfXORyHQ
+
+settings:
+  encodeUrl: false
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5

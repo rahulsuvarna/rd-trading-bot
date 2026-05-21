@@ -1,0 +1,12 @@
+pandas
+yfinance
+pandas-ta
+requests
+apscheduler
+pytz
+python-dotenv
+fastapi
+uvicorn
+python-multipart
+httpx
+matplotlib
