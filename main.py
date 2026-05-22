@@ -10,19 +10,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import pytz
-from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from broker.trading_loop import TradingLoop
+from broker.t212_client import T212Client
+from broker.trading_loop import TradingLoop, run_trading_cycle
 from config.logger import get_logger
 from config.settings import PAPER_STARTING_CASH, TRADING_MODE, get_startup_banner
-from monitoring.telegram_alert import send_alert
+from monitoring.journal import record_cycle
+from monitoring.telegram_alert import alert_cycle_detail, alert_cycle_summary, send_alert
+from risk.daily_loss_tracker import get_summary
 
 logger = get_logger(__name__)
 NY_TZ = pytz.timezone("America/New_York")
 
 # Global reference for clean shutdown
 trading_loop = None
+client = None
 scheduler = None
 shutdown_event = Event()
 
@@ -30,6 +34,22 @@ shutdown_event = Event()
 def trading_job():
     """Execute one trading cycle."""
     global trading_loop
+
+    # Backward-compatible path used by legacy tests.
+    if trading_loop is None and client is not None:
+        try:
+            result = run_trading_cycle(client)
+            record_cycle(result)
+
+            status = str(result.get("status", ""))
+            if status == "completed":
+                alert_cycle_detail(result)
+
+            get_summary()
+        except Exception as exc:
+            logger.exception("Legacy trading job failed: %s", exc)
+            send_alert(f"❌ Trading cycle failed: {str(exc)[:100]}")
+        return
 
     if trading_loop is None:
         logger.error("Trading loop not initialized")
@@ -111,7 +131,7 @@ def main():
         send_alert("⚠️ LIVE MODE ACTIVE - Real money trading enabled")
 
     # Setup scheduler for US market hours (Eastern Time)
-    scheduler = BlockingScheduler(timezone=NY_TZ)
+    scheduler = BackgroundScheduler(timezone=NY_TZ)
 
     # Schedule every 5 minutes from 9:35 AM to 3:55 PM Eastern, weekdays only
     scheduler.add_job(
@@ -144,26 +164,19 @@ def main():
     # Send scheduler start alert
     send_alert("⏰ Trading bot scheduler started - waiting for market hours")
 
+    scheduler.start()
+
     try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
+        while not shutdown_event.is_set():
+            shutdown_event.wait(timeout=1)
+    except KeyboardInterrupt:
         shutdown_event.set()
         logger.info("Keyboard interrupt received")
-        raise
-    except Exception as exc:
-        logger.exception("Scheduler error: %s", exc)
-        send_alert(f"❌ Trading bot crashed: {str(exc)[:100]}")
-        sys.exit(1)
     finally:
-        if scheduler and scheduler.running:
-            try:
-                scheduler.shutdown(wait=False)
-            except Exception as exc:
-                logger.warning("Final scheduler shutdown failed: %s", exc)
-
-        if shutdown_event.is_set():
-            logger.info("Bot stopped by user")
-            send_alert("🛑 Trading bot stopped")
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        logger.info("Bot stopped by user")
+        send_alert("🛑 Trading bot stopped")
 
 
 if __name__ == "__main__":

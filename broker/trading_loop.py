@@ -13,6 +13,7 @@ from risk.daily_loss_tracker import (
     record_trade_result,
     reset as reset_daily_tracker,
 )
+from risk.position_sizer import maybe_log_position_utilization
 from risk.risk_gate import evaluate as risk_evaluate
 from strategies.signal_runner import run_signals
 
@@ -170,8 +171,15 @@ class TradingLoop:
             if signal == "HOLD":
                 continue
 
+            current_positions_count = len(self.get_positions())
+            maybe_log_position_utilization(current_positions_count)
+
             # Run risk gate (only takes signal and capital)
-            risk_decision = risk_evaluate(signal=signal, capital=free_cash)
+            risk_decision = risk_evaluate(
+                signal=signal,
+                capital=free_cash,
+                current_positions_count=current_positions_count,
+            )
 
             if not risk_decision["approved"]:
                 logger.info("%s: Risk gate blocked - %s", ticker, risk_decision["reason"])

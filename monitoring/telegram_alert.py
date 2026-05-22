@@ -1,5 +1,7 @@
 """Telegram alert sending module."""
 
+from datetime import datetime
+
 import requests
 
 from config.logger import get_logger
@@ -76,5 +78,55 @@ def alert_cycle_summary(status: str, orders_executed: int) -> bool:
         f"📊 <b>Cycle complete</b>\n"
         f"Status: {status}\n"
         f"Orders executed: {orders_executed}"
+    )
+    return send_alert(message)
+
+
+def _format_signal_line(ticker: str, signal_payload: object) -> str | None:
+    if isinstance(signal_payload, str):
+        if signal_payload.upper() == "HOLD":
+            return None
+        return f"{ticker} → {signal_payload.upper()} ❌"
+
+    if not isinstance(signal_payload, dict):
+        return None
+
+    signal = str(signal_payload.get("signal", "")).upper() or "UNKNOWN"
+    executed = bool(signal_payload.get("executed", False))
+
+    if executed:
+        amount_value = signal_payload.get("cost")
+        if amount_value is None:
+            amount_value = signal_payload.get("proceeds", 0.0)
+        amount = float(amount_value or 0.0)
+        return f"{ticker} → {signal} £{amount:.2f} ✅"
+
+    reason = signal_payload.get("reason")
+    if reason:
+        return f"{ticker} → {signal} ❌ ({reason})"
+    return f"{ticker} → {signal} ❌"
+
+
+def alert_cycle_detail(cycle_result: dict) -> bool:
+    timestamp = datetime.now().strftime("%H:%M")
+    signals = cycle_result.get("signals", {})
+    lines: list[str] = []
+
+    if isinstance(signals, dict):
+        for ticker, signal_payload in signals.items():
+            line = _format_signal_line(ticker, signal_payload)
+            if line:
+                lines.append(line)
+
+    if not lines:
+        return send_alert("😴 All signals HOLD — no trades this cycle")
+
+    free_cash = float(cycle_result.get("free_cash", 0.0) or 0.0)
+    message = "\n".join(
+        [
+            f"📊 <b>Cycle complete</b> | {timestamp}",
+            *lines,
+            f"💰 Cash remaining: £{free_cash:.2f}",
+        ]
     )
     return send_alert(message)

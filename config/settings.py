@@ -1,7 +1,6 @@
 """Configuration settings loaded from environment variables."""
 
 import os
-import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,42 +10,17 @@ env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(env_path)
 
 # Trading 212 API Configuration
-# Support both regular and ISA prefixed keys (prefer ISA for ISA account)
-TRADING212_API_KEY = os.getenv("IISA_TRADING212_API_KEY") or os.getenv("TRADING212_API_KEY")
-TRADING212_API_SECRET = os.getenv("IISA_TRADING212_API_SECRET") or os.getenv("TRADING212_API_SECRET")
+TRADING212_API_KEY = os.getenv("TRADING212_API_KEY")
+TRADING212_API_SECRET = os.getenv("TRADING212_API_SECRET")
 TRADING212_ACCOUNT_TYPE = "ISA"  # Fixed for your use case
 
 # Alpaca API (for data - optional, falls back to yfinance)
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
-# Telegram alerts - use first non-empty value (handle duplicates)
+# Telegram alerts
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_BOT_TOKEN:
-    # Try reading from .env file manually to get the first non-empty value
-    try:
-        with open(env_path, "r", encoding="utf-8") as env_file:
-            content = env_file.read()
-            matches = re.findall(r"^TELEGRAM_BOT_TOKEN=(.+)$", content, re.MULTILINE)
-            for match in matches:
-                if match and match.strip() and "your_telegram_bot_token" not in match:
-                    TELEGRAM_BOT_TOKEN = match.strip()
-                    break
-    except Exception:
-        pass
-
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-if not TELEGRAM_CHAT_ID:
-    try:
-        with open(env_path, "r", encoding="utf-8") as env_file:
-            content = env_file.read()
-            matches = re.findall(r"^TELEGRAM_CHAT_ID=(.+)$", content, re.MULTILINE)
-            for match in matches:
-                if match and match.strip() and "your_telegram_chat_id" not in match:
-                    TELEGRAM_CHAT_ID = match.strip()
-                    break
-    except Exception:
-        pass
 
 # Environment (production/sandbox)
 ENV = os.getenv("ENV", "sandbox").lower()
@@ -76,6 +50,11 @@ if TRADING_MODE == "live":
 # Risk limits
 MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.01"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.05"))  # 5% default
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
+if MAX_CONCURRENT_POSITIONS < 1 or MAX_CONCURRENT_POSITIONS > 20:
+    raise ValueError(
+        "MAX_CONCURRENT_POSITIONS must be between 1 and 20"
+    )
 
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -115,7 +94,7 @@ def get_startup_banner() -> str:
 {'='*60}
   Mode:           {TRADING_MODE.upper()}
   Paper Cash:     £{PAPER_STARTING_CASH:.2f} (if paper mode)
-  Data Source:    {'Alpaca' if ALPACA_API_KEY else 'Yahoo Finance'}
+    Data Source:    {DATA_PROVIDER.title()}
   Watchlist:      {len(WATCHLIST_SYMBOLS)} symbols
   Log Level:      {LOG_LEVEL}
   Telegram:       {telegram_status}

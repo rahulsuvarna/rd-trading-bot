@@ -61,7 +61,11 @@ class TestSettings:
 
     def test_watchlist_default_returns_five_symbols(self):
         """Test WATCHLIST_SYMBOLS defaults to five symbols."""
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(
+            os.environ,
+            {"WATCHLIST": "SPY_US_EQ,QQQ_US_EQ,AAPL_US_EQ,MSFT_US_EQ,NVDA_US_EQ"},
+            clear=True,
+        ):
             import importlib
             import config.settings
 
