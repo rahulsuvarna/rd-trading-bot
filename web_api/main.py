@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+import gc
+import inspect
 import json
+import os
 import sqlite3
+import sys
+import tracemalloc
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Generator, Iterable, Iterator
 
-import yfinance as yf
-from fastapi import FastAPI, Query
+import httpx
+from fastapi import BackgroundTasks, FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - unavailable on Windows
+    resource = None
 
 from config.logger import get_logger
 from config.settings import DATA_PROVIDER, PAPER_STARTING_CASH, PROJECT_ROOT, TRADING_MODE
@@ -20,8 +32,16 @@ from utils.ticker_utils import to_data_provider_symbol, to_display_symbol
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _configure_uvloop()
+    _set_memory_limits()
+    _maybe_start_tracemalloc()
+    app.state.quote_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
+    app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(_HTTP_TIMEOUT_SECONDS))
     initialise_journal()  # ensures orders column exists in existing DBs
-    yield
+    try:
+        yield
+    finally:
+        await app.state.http_client.aclose()
 
 
 app = FastAPI(title="Trading Bot Web Dashboard", lifespan=lifespan)
@@ -39,37 +59,203 @@ STATIC_INDEX = PROJECT_ROOT / "web_api" / "static" / "index.html"
 
 logger = get_logger(__name__)
 _HAS_LOGGED_ORDER_STRUCTURE = False
-_HISTORICAL_PRICE_CACHE: dict[tuple[str, str], float | None] = {}
+_GC_CHECK_INTERVAL_ROWS = 250
+_MEMORY_LIMIT_MB = int(os.getenv("WEB_API_MEMORY_LIMIT_MB", "320"))
+_GC_THRESHOLD_MB = int(os.getenv("WEB_API_GC_THRESHOLD_MB", "220"))
+_TRACEMALLOC_ENABLED = os.getenv("WEB_API_ENABLE_TRACEMALLOC", "0") == "1"
+_TRACEMALLOC_FRAMES = int(os.getenv("WEB_API_TRACEMALLOC_FRAMES", "15"))
+_MAX_CONCURRENT_REQUESTS = int(os.getenv("WEB_API_MAX_CONCURRENT_REQUESTS", "4"))
+_HTTP_TIMEOUT_SECONDS = float(os.getenv("WEB_API_HTTP_TIMEOUT_SECONDS", "8.0"))
+_QUOTE_CACHE_SIZE = int(os.getenv("WEB_API_QUOTE_CACHE_SIZE", "512"))
+_QUOTE_CACHE: OrderedDict[str, float | None] = OrderedDict()
+_HISTORICAL_QUOTE_CACHE: OrderedDict[str, float | None] = OrderedDict()
 
 
-def _fetch_historical_price(ticker: str, timestamp: str) -> float | None:
-    """Return the closing price nearest to *timestamp* from yfinance (1-min bars).
-    Results are cached in-process so a single reconstruction pass is cheap.
-    """
-    symbol = to_data_provider_symbol(ticker, DATA_PROVIDER)
-    key = (symbol, timestamp[:16])  # cache at minute granularity
-    if key in _HISTORICAL_PRICE_CACHE:
-        return _HISTORICAL_PRICE_CACHE[key]
-
-    ts = _safe_parse_time(timestamp)
-    start = (ts - timedelta(minutes=5)).strftime("%Y-%m-%d")
-    end = (ts + timedelta(minutes=10)).strftime("%Y-%m-%d")
+def _configure_uvloop() -> None:
+    if os.getenv("WEB_API_USE_UVLOOP", "0") != "1":
+        return
     try:
-        hist = yf.Ticker(symbol).history(start=start, end=end, interval="1m")
-        if hist.empty:
-            _HISTORICAL_PRICE_CACHE[key] = None
-            return None
-        if hist.index.tzinfo is None:
-            hist.index = hist.index.tz_localize("UTC")
-        else:
-            hist.index = hist.index.tz_convert("UTC")
-        diffs = abs(hist.index - ts)
-        price = float(hist["Close"].iloc[diffs.argmin()])
-        _HISTORICAL_PRICE_CACHE[key] = price
-        return price
-    except Exception:
-        _HISTORICAL_PRICE_CACHE[key] = None
+        import uvloop  # type: ignore[import-not-found]
+
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        logger.info("WEB_API | uvloop enabled")
+    except Exception as exc:
+        logger.warning("WEB_API | uvloop not enabled: %s", exc)
+
+
+def _cache_get(cache: OrderedDict[str, float | None], key: str) -> float | None | object:
+    value = cache.get(key, _CACHE_MISS)
+    if value is _CACHE_MISS:
+        return _CACHE_MISS
+    cache.move_to_end(key)
+    return value
+
+
+def _cache_set(cache: OrderedDict[str, float | None], key: str, value: float | None) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    if len(cache) > _QUOTE_CACHE_SIZE:
+        cache.popitem(last=False)
+
+
+def _background_maintenance(processed_rows: int) -> None:
+    _maybe_collect_garbage(processed_rows)
+
+
+_CACHE_MISS = object()
+
+
+def _ensure_runtime_clients(request: Request) -> tuple[httpx.AsyncClient, asyncio.Semaphore]:
+    if not hasattr(request.app.state, "quote_semaphore"):
+        request.app.state.quote_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
+    if not hasattr(request.app.state, "http_client"):
+        request.app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(_HTTP_TIMEOUT_SECONDS))
+    return request.app.state.http_client, request.app.state.quote_semaphore
+
+
+async def _await_if_needed(value: object) -> object:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _get_memory_usage_mb() -> float | None:
+    if resource is None:
         return None
+    getrusage = getattr(resource, "getrusage", None)
+    rusage_self = getattr(resource, "RUSAGE_SELF", None)
+    if getrusage is None or rusage_self is None:
+        return None
+    usage = getrusage(rusage_self)
+    rss = float(getattr(usage, "ru_maxrss", 0.0))
+    if sys.platform == "darwin":
+        return rss / (1024.0 * 1024.0)
+    return rss / 1024.0
+
+
+def _set_memory_limits() -> None:
+    if resource is None:
+        logger.info("WEB_API | resource module unavailable; memory limits disabled")
+        return
+
+    if _MEMORY_LIMIT_MB <= 0:
+        logger.info("WEB_API | memory limit disabled (WEB_API_MEMORY_LIMIT_MB <= 0)")
+        return
+
+    getrlimit = getattr(resource, "getrlimit", None)
+    setrlimit = getattr(resource, "setrlimit", None)
+    if getrlimit is None or setrlimit is None:
+        logger.warning("WEB_API | getrlimit/setrlimit unavailable; memory limits disabled")
+        return
+
+    soft_limit_bytes = _MEMORY_LIMIT_MB * 1024 * 1024
+    for limit_name in ("RLIMIT_AS", "RLIMIT_DATA"):
+        limit = getattr(resource, limit_name, None)
+        if limit is None:
+            continue
+        try:
+            _, current_hard = getrlimit(limit)
+            target_soft = min(soft_limit_bytes, current_hard) if current_hard > 0 else soft_limit_bytes
+            setrlimit(limit, (target_soft, current_hard))
+            logger.info("WEB_API | set %s soft limit to %s MB", limit_name, target_soft // (1024 * 1024))
+        except (ValueError, OSError) as exc:
+            logger.warning("WEB_API | failed to set %s: %s", limit_name, exc)
+
+
+def _maybe_collect_garbage(processed_rows: int) -> None:
+    if processed_rows % _GC_CHECK_INTERVAL_ROWS != 0:
+        return
+
+    memory_mb = _get_memory_usage_mb()
+    if memory_mb is None:
+        return
+
+    if memory_mb >= _GC_THRESHOLD_MB:
+        collected = gc.collect()
+        logger.info(
+            "WEB_API | gc.collect() triggered at %.1fMB (threshold=%sMB), reclaimed=%s",
+            memory_mb,
+            _GC_THRESHOLD_MB,
+            collected,
+        )
+
+
+def _maybe_start_tracemalloc() -> None:
+    if not _TRACEMALLOC_ENABLED or tracemalloc.is_tracing():
+        return
+    tracemalloc.start(_TRACEMALLOC_FRAMES)
+    logger.info("WEB_API | tracemalloc enabled (frames=%s)", _TRACEMALLOC_FRAMES)
+
+
+async def _fetch_yahoo_chart(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    symbol: str,
+    params: dict[str, str | int],
+) -> dict | None:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    try:
+        async with semaphore:
+            response = await client.get(url, params=params)
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("chart", {}).get("result", [])
+        if not result:
+            return None
+        return result[0]
+    except Exception:
+        return None
+
+
+def _extract_close_points(result: dict) -> list[tuple[int, float]]:
+    timestamps = result.get("timestamp") or []
+    quote = (result.get("indicators") or {}).get("quote") or []
+    closes = quote[0].get("close") if quote else []
+    points: list[tuple[int, float]] = []
+    for ts, close in zip(timestamps, closes):
+        if close is None:
+            continue
+        try:
+            points.append((int(ts), float(close)))
+        except (TypeError, ValueError):
+            continue
+    return points
+
+
+async def _fetch_historical_price(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    ticker: str,
+    timestamp_minute: str,
+) -> float | None:
+    cache_key = f"hist:{ticker}:{timestamp_minute}"
+    cached = _cache_get(_HISTORICAL_QUOTE_CACHE, cache_key)
+    if cached is not _CACHE_MISS:
+        return cached  # type: ignore[return-value]
+
+    symbol = to_data_provider_symbol(ticker, DATA_PROVIDER)
+    ts = _safe_parse_time(timestamp_minute).astimezone(timezone.utc)
+    params: dict[str, str | int] = {
+        "period1": int((ts - timedelta(minutes=10)).timestamp()),
+        "period2": int((ts + timedelta(minutes=10)).timestamp()),
+        "interval": "1m",
+        "includePrePost": "false",
+        "events": "div,split",
+    }
+    result = await _fetch_yahoo_chart(client, semaphore, symbol, params)
+    if result is None:
+        _cache_set(_HISTORICAL_QUOTE_CACHE, cache_key, None)
+        return None
+
+    points = _extract_close_points(result)
+    if not points:
+        _cache_set(_HISTORICAL_QUOTE_CACHE, cache_key, None)
+        return None
+
+    target_ts = int(ts.timestamp())
+    nearest = min(points, key=lambda p: abs(p[0] - target_ts))[1]
+    _cache_set(_HISTORICAL_QUOTE_CACHE, cache_key, nearest)
+    return nearest
 
 
 class JournalState:
@@ -77,6 +263,8 @@ class JournalState:
         self.mode = TRADING_MODE
         self.starting_cash = float(PAPER_STARTING_CASH)
         self.cash = float(PAPER_STARTING_CASH)
+        self.max_trades: int | None = None
+        self.max_cycles: int | None = None
         self.positions: dict[str, dict[str, float]] = {}
         self.trades: list[dict] = []
         self.cycles: list[dict] = []
@@ -86,6 +274,16 @@ class JournalState:
         self.positions = {}
         self.trades = []
         self.cycles = []
+
+    def append_trade(self, trade: dict) -> None:
+        self.trades.append(trade)
+        if self.max_trades is not None and len(self.trades) > self.max_trades:
+            del self.trades[0]
+
+    def append_cycle(self, cycle: dict) -> None:
+        self.cycles.append(cycle)
+        if self.max_cycles is not None and len(self.cycles) > self.max_cycles:
+            del self.cycles[0]
 
 
 def _safe_parse_time(ts: str | None) -> datetime:
@@ -108,7 +306,7 @@ def _safe_float(value: object) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
 
@@ -117,34 +315,40 @@ def _normalize_timestamp(ts: str | None) -> str:
     return _safe_parse_time(ts).astimezone(timezone.utc).isoformat()
 
 
-def _load_cycle_rows() -> list[sqlite3.Row]:
+def _iter_cycle_rows(batch_size: int = 500) -> Iterator[sqlite3.Row]:
     if not JOURNAL_PATH.exists():
-        return []
+        return
 
     connection = sqlite3.connect(JOURNAL_PATH)
-    connection.row_factory = sqlite3.Row
-    cursor = connection.cursor()
+    try:
+        connection.row_factory = sqlite3.Row
+        cursor = connection.cursor()
 
-    cursor.execute("PRAGMA table_info(cycles)")
-    columns = {str(row[1]).lower() for row in cursor.fetchall()}
+        cursor.execute("PRAGMA table_info(cycles)")
+        columns = {str(row[1]).lower() for row in cursor.fetchall()}
 
-    if "orders" in columns:
-        query = """
-        SELECT id, timestamp, status, reason, free_cash, signals, orders, orders_executed, orders_approved
-        FROM cycles
-        ORDER BY id ASC
-        """
-    else:
-        query = """
-        SELECT id, timestamp, status, reason, free_cash, signals, NULL AS orders, orders_executed, orders_approved
-        FROM cycles
-        ORDER BY id ASC
-        """
+        if "orders" in columns:
+            query = """
+            SELECT id, timestamp, status, reason, free_cash, signals, orders, orders_executed, orders_approved
+            FROM cycles
+            ORDER BY id ASC
+            """
+        else:
+            query = """
+            SELECT id, timestamp, status, reason, free_cash, signals, NULL AS orders, orders_executed, orders_approved
+            FROM cycles
+            ORDER BY id ASC
+            """
 
-    cursor.execute(query)
-    rows = cursor.fetchall()
-    connection.close()
-    return rows
+        cursor.execute(query)
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                break
+            for row in rows:
+                yield row
+    finally:
+        connection.close()
 
 
 def _apply_buy(state: JournalState, timestamp: str, ticker: str, shares: float, price: float) -> None:
@@ -160,7 +364,7 @@ def _apply_buy(state: JournalState, timestamp: str, ticker: str, shares: float, 
     state.positions[ticker] = {"shares": new_shares, "avg_cost": new_avg}
     state.cash = round(state.cash - cost, 6)
 
-    state.trades.append(
+    state.append_trade(
         {
             "timestamp": timestamp,
             "ticker": ticker,
@@ -203,7 +407,7 @@ def _apply_sell(
 
     state.cash = round(state.cash + proceeds, 6)
 
-    state.trades.append(
+    state.append_trade(
         {
             "timestamp": timestamp,
             "ticker": ticker,
@@ -215,8 +419,12 @@ def _apply_sell(
     )
 
 
-def _parse_signal_payload(
-    signal_payload: object, timestamp: str = "", ticker: str = ""
+async def _parse_signal_payload(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    signal_payload: object,
+    timestamp: str = "",
+    ticker: str = "",
 ) -> tuple[str, float, float | None, float | None, bool]:
     signal = "HOLD"
     price = 0.0
@@ -232,9 +440,9 @@ def _parse_signal_payload(
         executed = bool(signal_payload.get("executed", False))
     elif isinstance(signal_payload, str):
         signal = signal_payload.upper()
-        # Legacy plain-string signal — try to recover price from yfinance history.
+        # Legacy plain-string signal — recover price with async Yahoo call.
         if signal in {"BUY", "SELL"} and ticker and timestamp:
-            historical = _fetch_historical_price(ticker, timestamp)
+            historical = await _fetch_historical_price(client, semaphore, ticker, timestamp[:16])
             if historical is not None:
                 price = historical
 
@@ -310,7 +518,9 @@ def _apply_resolved_signal(
     _apply_signal_trade(state, timestamp, ticker, signal, price, shares, effective_amount)
 
 
-def _process_signals_into_trades(
+async def _process_signals_into_trades(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
     state: JournalState,
     timestamp: str,
     signals: dict,
@@ -318,14 +528,17 @@ def _process_signals_into_trades(
     cash_before: float | None = None,
     cash_after: float | None = None,
 ) -> None:
-    resolved = [
-        (ticker, sig, price, shares, amount, executed)
-        for ticker, payload in signals.items()
-        for sig, price, shares, amount, executed in [
-            _parse_signal_payload(payload, timestamp=timestamp, ticker=ticker)
-        ]
-        if sig in {"BUY", "SELL"}
-    ]
+    resolved: list[tuple[str, str, float, float | None, float | None, bool]] = []
+    for ticker, payload in signals.items():
+        sig, price, shares, amount, executed = await _parse_signal_payload(
+            client,
+            semaphore,
+            payload,
+            timestamp=timestamp,
+            ticker=ticker,
+        )
+        if sig in {"BUY", "SELL"}:
+            resolved.append((ticker, sig, price, shares, amount, executed))
 
     cash_delta_per_trade = _estimate_cash_delta_per_trade(
         resolved, orders_executed, cash_before, cash_after
@@ -466,21 +679,60 @@ def _log_first_order_structure(rows: list[sqlite3.Row]) -> None:
     _HAS_LOGGED_ORDER_STRUCTURE = True
 
 
-def _fetch_current_prices(tickers: list[str]) -> dict[str, float]:
+async def _fetch_current_price_for_ticker(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    ticker: str,
+) -> float | None:
+    cache_key = f"cur:{ticker}"
+    cached = _cache_get(_QUOTE_CACHE, cache_key)
+    if cached is not _CACHE_MISS:
+        return cached  # type: ignore[return-value]
+
+    symbol = to_data_provider_symbol(ticker, DATA_PROVIDER)
+    params: dict[str, str | int] = {
+        "range": "1d",
+        "interval": "1m",
+        "includePrePost": "false",
+        "events": "div,split",
+    }
+    result = await _fetch_yahoo_chart(client, semaphore, symbol, params)
+    if result is None:
+        _cache_set(_QUOTE_CACHE, cache_key, None)
+        return None
+
+    points = _extract_close_points(result)
+    if not points:
+        _cache_set(_QUOTE_CACHE, cache_key, None)
+        return None
+
+    latest_price = points[-1][1]
+    _cache_set(_QUOTE_CACHE, cache_key, latest_price)
+    return latest_price
+
+
+async def _fetch_current_prices(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    tickers: list[str],
+) -> dict[str, float]:
     prices: dict[str, float] = {}
-    for ticker in tickers:
-        symbol = to_data_provider_symbol(ticker, DATA_PROVIDER)
-        try:
-            hist = yf.Ticker(symbol).history(period="1d", interval="1m")
-            if not hist.empty:
-                prices[ticker] = float(hist["Close"].iloc[-1])
-        except Exception:
+
+    async def _fetch_one(ticker: str) -> tuple[str, float | None]:
+        return ticker, await _fetch_current_price_for_ticker(client, semaphore, ticker)
+
+    results = await asyncio.gather(*(_fetch_one(ticker) for ticker in tickers), return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
             continue
+        ticker, price = result
+        if price is not None:
+            prices[ticker] = price
     return prices
 
 
 def _append_cycle(state: JournalState, row: sqlite3.Row, timestamp: str, signals: dict) -> None:
-    state.cycles.append(
+    state.append_cycle(
         {
             "id": int(row["id"]),
             "timestamp": timestamp,
@@ -494,17 +746,30 @@ def _append_cycle(state: JournalState, row: sqlite3.Row, timestamp: str, signals
     )
 
 
-def reconstruct_state() -> JournalState:
+async def reconstruct_state(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    max_trades: int | None = None,
+    max_cycles: int | None = None,
+) -> JournalState:
+    global _HAS_LOGGED_ORDER_STRUCTURE
+
     state = JournalState()
     state.reset()
-    rows = _load_cycle_rows()
-    _log_first_order_structure(rows)
+    state.max_trades = max_trades
+    state.max_cycles = max_cycles
 
-    for row in rows:
+    processed_rows = 0
+    for row in _iter_cycle_rows():
+        processed_rows += 1
         timestamp = _normalize_timestamp(row["timestamp"])
         orders_executed = int(row["orders_executed"] or 0)
         signals = _parse_signals_from_row(row)
         orders = _parse_orders_from_row(row)
+
+        if not _HAS_LOGGED_ORDER_STRUCTURE and orders:
+            logger.info("WEB_API | first order keys detected: %s", sorted(orders[0].keys()))
+            _HAS_LOGGED_ORDER_STRUCTURE = True
 
         cash_before = float(state.cash)
         if row["free_cash"] is not None:
@@ -515,13 +780,21 @@ def reconstruct_state() -> JournalState:
         if orders:
             _process_orders_into_trades(state, timestamp, orders)
         else:
-            _process_signals_into_trades(
+            await _process_signals_into_trades(
+                client,
+                semaphore,
                 state, timestamp, signals, orders_executed,
                 cash_before=cash_before, cash_after=cash_after,
             )
 
         state.cash = cash_after
         _append_cycle(state, row, timestamp, signals)
+        _maybe_collect_garbage(processed_rows)
+        if processed_rows % 200 == 0:
+            await asyncio.sleep(0.01)
+
+    if not _HAS_LOGGED_ORDER_STRUCTURE:
+        _HAS_LOGGED_ORDER_STRUCTURE = True
 
     return state
 
@@ -558,18 +831,52 @@ def _today_pnl(state: JournalState) -> float:
     return pnl
 
 
+def _iter_json_array_chunks(items: Iterable[dict]) -> Generator[str, None, None]:
+    yield "["
+    first = True
+    for item in items:
+        if not first:
+            yield ","
+        else:
+            first = False
+        yield json.dumps(item, separators=(",", ":"), ensure_ascii=True)
+    yield "]"
+
+
+def _iter_recent_trades(state: JournalState, limit: int) -> Iterator[dict]:
+    for trade in reversed(state.trades[-limit:]):
+        yield {
+            **trade,
+            "timestamp": _normalize_timestamp(trade.get("timestamp")),
+            "ticker": _display_ticker(str(trade.get("ticker", ""))),
+        }
+
+
+def _iter_recent_cycles(state: JournalState, limit: int) -> Iterator[dict]:
+    for cycle in reversed(state.cycles[-limit:]):
+        yield {
+            "timestamp": cycle["timestamp"],
+            "orders_executed": cycle["orders_executed"],
+            "free_cash": cycle["free_cash"],
+        }
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_INDEX)
 
 
 @app.get("/api/state")
-def api_state() -> dict:
-    state = reconstruct_state()
-    prices = _fetch_current_prices(list(state.positions.keys()))
+async def api_state(request: Request, background_tasks: BackgroundTasks) -> dict:
+    client, semaphore = _ensure_runtime_clients(request)
+    state = await reconstruct_state(client, semaphore, max_trades=2000, max_cycles=5000)
+    prices_result = _fetch_current_prices(client, semaphore, list(state.positions.keys()))
+    prices = await _await_if_needed(prices_result)
+    prices = prices if isinstance(prices, dict) else {}
     position_rows = _compute_position_rows(state, prices)
     market_value = sum((row["current_price"] * row["shares"]) for row in position_rows)
     unrealized = sum(row["pnl"] for row in position_rows)
+    background_tasks.add_task(_background_maintenance, len(state.cycles))
 
     return {
         "mode": state.mode,
@@ -585,29 +892,35 @@ def api_state() -> dict:
 
 
 @app.get("/api/positions")
-def api_positions() -> list[dict]:
-    state = reconstruct_state()
-    prices = _fetch_current_prices(list(state.positions.keys()))
+async def api_positions(request: Request, background_tasks: BackgroundTasks) -> list[dict]:
+    client, semaphore = _ensure_runtime_clients(request)
+    state = await reconstruct_state(client, semaphore, max_cycles=2000)
+    prices_result = _fetch_current_prices(client, semaphore, list(state.positions.keys()))
+    prices = await _await_if_needed(prices_result)
+    prices = prices if isinstance(prices, dict) else {}
+    background_tasks.add_task(_background_maintenance, len(state.cycles))
     return _compute_position_rows(state, prices)
 
 
 @app.get("/api/trades")
-def api_trades(limit: Annotated[int, Query(ge=1, le=500)] = 50) -> list[dict]:
-    state = reconstruct_state()
-    trades = state.trades[-limit:][::-1]
-    return [
-        {
-            **trade,
-            "timestamp": _normalize_timestamp(trade.get("timestamp")),
-            "ticker": _display_ticker(str(trade.get("ticker", ""))),
-        }
-        for trade in trades
-    ]
+async def api_trades(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+) -> StreamingResponse:
+    client, semaphore = _ensure_runtime_clients(request)
+    state = await reconstruct_state(client, semaphore, max_trades=max(limit * 20, 1000), max_cycles=3000)
+    background_tasks.add_task(_background_maintenance, len(state.cycles))
+    return StreamingResponse(
+        _iter_json_array_chunks(_iter_recent_trades(state, limit)),
+        media_type="application/json",
+    )
 
 
 @app.get("/api/equity_history")
-def api_equity_history() -> dict:
-    state = reconstruct_state()
+async def api_equity_history(request: Request, background_tasks: BackgroundTasks) -> dict:
+    client, semaphore = _ensure_runtime_clients(request)
+    state = await reconstruct_state(client, semaphore, max_cycles=10000)
     cycles = state.cycles
     if not cycles:
         return {"timestamps": [], "values": []}
@@ -620,18 +933,51 @@ def api_equity_history() -> dict:
     filtered = filtered[-100:]
     timestamps = [c["timestamp"] for c in filtered]
     values = [float(c.get("free_cash", 0.0)) for c in filtered]
+    background_tasks.add_task(_background_maintenance, len(state.cycles))
 
     return {"timestamps": timestamps, "values": values}
 
 
 @app.get("/api/cycle_history")
-def api_cycle_history() -> list[dict]:
-    state = reconstruct_state()
-    return [
-        {
-            "timestamp": c["timestamp"],
-            "orders_executed": c["orders_executed"],
-            "free_cash": c["free_cash"],
-        }
-        for c in state.cycles[-100:][::-1]
-    ]
+async def api_cycle_history(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+) -> StreamingResponse:
+    client, semaphore = _ensure_runtime_clients(request)
+    state = await reconstruct_state(client, semaphore, max_cycles=max(limit * 20, 2000), max_trades=1000)
+    background_tasks.add_task(_background_maintenance, len(state.cycles))
+    return StreamingResponse(
+        _iter_json_array_chunks(_iter_recent_cycles(state, limit)),
+        media_type="application/json",
+    )
+
+
+@app.get("/api/debug/memory")
+def api_debug_memory(limit: Annotated[int, Query(ge=1, le=30)] = 10) -> dict:
+    """Expose tracemalloc snapshots to identify top allocation lines."""
+    if not tracemalloc.is_tracing():
+        tracemalloc.start(_TRACEMALLOC_FRAMES)
+
+    current, peak = tracemalloc.get_traced_memory()
+    snapshot = tracemalloc.take_snapshot()
+    top_stats = snapshot.statistics("lineno")[:limit]
+    memory_mb = _get_memory_usage_mb()
+
+    return {
+        "rss_mb": round(memory_mb, 2) if memory_mb is not None else None,
+        "tracemalloc_current_mb": round(current / (1024 * 1024), 3),
+        "tracemalloc_peak_mb": round(peak / (1024 * 1024), 3),
+        "top_allocations": [
+            {
+                "location": str(stat.traceback[0]),
+                "size_kb": round(stat.size / 1024, 2),
+                "count": stat.count,
+            }
+            for stat in top_stats
+        ],
+        "notes": [
+            "Set WEB_API_ENABLE_TRACEMALLOC=1 to start tracing on app startup.",
+            "Call this endpoint while traffic is active for useful snapshots.",
+        ],
+    }
