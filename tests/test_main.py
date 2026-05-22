@@ -34,16 +34,16 @@ class TestMainTradingJob(unittest.TestCase):
 
     @patch("main.send_alert")
     @patch("main.T212Client")
-    @patch("main.alert_cycle_summary")
+    @patch("main.alert_cycle_detail")
     @patch("main.get_summary")
     @patch("main.record_cycle")
     @patch("main.run_trading_cycle")
-    def test_trading_job_calls_alert_cycle_summary_when_completed(
+    def test_trading_job_calls_alert_cycle_detail_when_completed(
         self,
         mock_run_trading_cycle: MagicMock,
         mock_record_cycle: MagicMock,
         mock_get_summary: MagicMock,
-        mock_alert_cycle_summary: MagicMock,
+        mock_alert_cycle_detail: MagicMock,
         mock_t212_client: MagicMock,
         mock_send_alert: MagicMock,
     ) -> None:
@@ -64,20 +64,20 @@ class TestMainTradingJob(unittest.TestCase):
 
         trading_job()
 
-        mock_alert_cycle_summary.assert_called_once_with("completed", 1)
+        mock_alert_cycle_detail.assert_called_once_with(result)
 
     @patch("main.send_alert")
     @patch("main.T212Client")
-    @patch("main.alert_cycle_summary")
+    @patch("main.alert_cycle_detail")
     @patch("main.get_summary")
     @patch("main.record_cycle")
     @patch("main.run_trading_cycle")
-    def test_trading_job_does_not_call_alert_cycle_summary_when_aborted(
+    def test_trading_job_does_not_call_alert_cycle_detail_when_aborted(
         self,
         mock_run_trading_cycle: MagicMock,
         mock_record_cycle: MagicMock,
         mock_get_summary: MagicMock,
-        mock_alert_cycle_summary: MagicMock,
+        mock_alert_cycle_detail: MagicMock,
         mock_t212_client: MagicMock,
         mock_send_alert: MagicMock,
     ) -> None:
@@ -87,7 +87,7 @@ class TestMainTradingJob(unittest.TestCase):
 
         trading_job()
 
-        mock_alert_cycle_summary.assert_not_called()
+        mock_alert_cycle_detail.assert_not_called()
 
 
 if __name__ == "__main__":
