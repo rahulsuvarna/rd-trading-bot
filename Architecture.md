@@ -166,7 +166,7 @@ Key tests include:
 ## External Integrations
 - Trading 212 Public API via requests
 - Yahoo Finance market data via yfinance
-- Technical indicators via pandas-ta
+- Technical indicators via ta
 - Telegram Bot API for operational alerts
 - SQLite for local durable journaling
 

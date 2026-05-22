@@ -1,6 +1,6 @@
 pandas
 yfinance
-pandas-ta
+ta
 requests
 apscheduler
 pytz
