@@ -155,6 +155,7 @@ class TradingLoop:
         for ticker, signal_data in signals.items():
             signal = "HOLD"
             price = 0.0
+            current_position = 0.0
 
             if isinstance(signal_data, dict):
                 signal = str(signal_data.get("signal", "HOLD"))
@@ -170,6 +171,18 @@ class TradingLoop:
 
             if signal == "HOLD":
                 continue
+
+            if signal == "SELL":
+                current_position = self.get_positions().get(ticker, 0.0)
+                if current_position <= 0:
+                    logger.warning("%s: Cannot sell - no position held", ticker)
+                    enriched_signals[ticker] = {
+                        "signal": signal,
+                        "price": price,
+                        "executed": False,
+                        "reason": "no_position_held",
+                    }
+                    continue
 
             current_positions_count = len(self.get_positions())
             maybe_log_position_utilization(current_positions_count)
@@ -200,17 +213,6 @@ class TradingLoop:
                     ticker, "BUY", trade_amount, price
                 )
             else:  # SELL
-                # For sell, we need current shares held
-                current_position = self.get_positions().get(ticker, 0.0)
-                if current_position <= 0:
-                    logger.warning("%s: Cannot sell - no position held", ticker)
-                    enriched_signals[ticker] = {
-                        "signal": signal,
-                        "price": price,
-                        "executed": False,
-                        "reason": "no_position_held",
-                    }
-                    continue
                 order_result = self.executor.execute_order(
                     ticker, "SELL", current_position, price
                 )

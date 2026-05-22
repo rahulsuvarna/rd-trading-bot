@@ -63,6 +63,23 @@ class TestTradingLoopPaperMode:
             assert loop.get_available_cash() == pytest.approx(2000.0)
             assert loop.get_positions() == {}
 
+    def test_run_cycle_sell_without_position_is_not_approved(self):
+        """Test sell signals with no holdings are skipped before approval."""
+        with patch("broker.trading_loop.initialise"), patch(
+            "broker.trading_loop.run_pipeline"
+        ) as mock_run_pipeline:
+            mock_run_pipeline.return_value = {
+                "AAPL_US_EQ": Mock(),
+            }
+            loop = TradingLoop(mode="paper", starting_paper_cash=1000.0)
+
+            with patch("broker.trading_loop.run_signals", return_value={"AAPL_US_EQ": "SELL"}):
+                result = loop.run_cycle()
+
+        assert result["orders_executed"] == 0
+        assert result["orders_approved"] == 0
+        assert result["signals"]["AAPL_US_EQ"]["reason"] == "no_position_held"
+
 
 class TestTradingLoopLiveMode:
     """Tests for live mode trading loop."""
