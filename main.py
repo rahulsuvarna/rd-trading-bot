@@ -17,8 +17,10 @@ from broker.t212_client import T212Client
 from broker.trading_loop import TradingLoop, run_trading_cycle
 from config.logger import get_logger
 from config.settings import PAPER_STARTING_CASH, TRADING_MODE, get_startup_banner
+from config.settings import BROKER
+from config.watchlist import WATCHLIST
 from monitoring.journal import record_cycle
-from monitoring.telegram_alert import alert_cycle_detail, alert_cycle_summary, send_alert
+from monitoring.telegram_alert import alert_cycle_detail, send_alert
 from risk.daily_loss_tracker import get_summary
 
 logger = get_logger(__name__)
@@ -65,10 +67,16 @@ def trading_job():
         # Send alert for kill switch activation
         if result.get("reason") == "kill_switch_active":
             send_alert("🔴 KILL SWITCH ACTIVE - Daily loss limit reached. Trading halted.")
-        elif result.get("orders_executed", 0) > 0:
+        elif result.get("status") == "aborted":
+            reason = str(result.get("reason") or "unknown")
+            free_cash = float(result.get("free_cash", 0.0) or 0.0)
             send_alert(
-                f"📊 Cycle complete: {result['orders_executed']} orders executed, {result.get('orders_approved', 0)} approved"
+                "⚠️ <b>Cycle aborted</b>\n"
+                f"Reason: {reason}\n"
+                f"Cash available: £{free_cash:.2f}"
             )
+        else:
+            alert_cycle_detail(result)
 
     except Exception as exc:
         logger.exception("Trading job failed: %s", exc)
@@ -105,18 +113,33 @@ def main():
 
     # Send startup alert
     mode_emoji = "📄" if TRADING_MODE == "paper" else "💰"
-    send_alert(f"{mode_emoji} Trading bot started in {TRADING_MODE.upper()} mode")
+    send_alert(
+        f"{mode_emoji} <b>Trading bot started</b>\n"
+        f"Mode: {TRADING_MODE.upper()} ({BROKER.upper()})\n"
+        f"Watchlist: {len(WATCHLIST)} symbols\n"
+        "Schedule: every 5m, 09:35-15:55 ET"
+    )
 
     # Initialize trading loop
     logger.info(f"Initializing trading loop in {TRADING_MODE.upper()} mode")
 
     if TRADING_MODE == "paper":
-        trading_loop = TradingLoop(
-            mode="paper",
-            starting_paper_cash=PAPER_STARTING_CASH,
-            live_client=None,
-        )
-        logger.info(f"Paper mode active with £{PAPER_STARTING_CASH:.2f} starting cash")
+        if BROKER == "alpaca":
+            from broker.alpaca_client import AlpacaClient
+            alpaca_client = AlpacaClient()
+            trading_loop = TradingLoop(
+                mode="alpaca",
+                starting_paper_cash=PAPER_STARTING_CASH,
+                live_client=alpaca_client,
+            )
+            logger.info("Using Alpaca paper trading account")
+        else:
+            trading_loop = TradingLoop(
+                mode="paper",
+                starting_paper_cash=PAPER_STARTING_CASH,
+                live_client=None,
+            )
+            logger.info(f"Paper mode active with £{PAPER_STARTING_CASH:.2f} starting cash")
     else:
         # Live mode - will need Trading 212 client
         from broker.t212_client import T212Client
@@ -162,7 +185,12 @@ def main():
     logger.info("Daily reset at 9:30 AM ET")
 
     # Send scheduler start alert
-    send_alert("⏰ Trading bot scheduler started - waiting for market hours")
+    send_alert(
+        "⏰ <b>Scheduler active</b>\n"
+        "Window: Mon-Fri, 09:35-15:55 ET\n"
+        "Reset: 09:30 ET\n"
+        "Status: waiting for market hours"
+    )
 
     scheduler.start()
 

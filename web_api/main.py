@@ -371,6 +371,7 @@ def _apply_buy(state: JournalState, timestamp: str, ticker: str, shares: float, 
             "action": "BUY",
             "shares": shares,
             "price": price,
+            "value": cost,
             "pnl": 0.0,
         }
     )
@@ -414,6 +415,7 @@ def _apply_sell(
             "action": "SELL",
             "shares": sell_shares,
             "price": price,
+            "value": proceeds,
             "pnl": realized_pnl,
         }
     )
@@ -845,8 +847,15 @@ def _iter_json_array_chunks(items: Iterable[dict]) -> Generator[str, None, None]
 
 def _iter_recent_trades(state: JournalState, limit: int) -> Iterator[dict]:
     for trade in reversed(state.trades[-limit:]):
+        shares = _safe_float(trade.get("shares")) or 0.0
+        price = _safe_float(trade.get("price")) or 0.0
+        value = _safe_float(trade.get("value"))
+        if value is None:
+            value = round(shares * price, 6)
+
         yield {
             **trade,
+            "value": value,
             "timestamp": _normalize_timestamp(trade.get("timestamp")),
             "ticker": _display_ticker(str(trade.get("ticker", ""))),
         }

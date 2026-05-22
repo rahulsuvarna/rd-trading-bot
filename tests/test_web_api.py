@@ -217,6 +217,9 @@ def test_trades_non_empty_when_orders_exist(tmp_path: Path):
         assert {trade["action"] for trade in payload} == {"BUY", "SELL"}
         assert all("T" in trade["timestamp"] for trade in payload)
         assert all(trade["ticker"] == "MSFT" for trade in payload)
+        assert all("value" in trade for trade in payload)
+        assert payload[0]["value"] == pytest.approx(115.0)
+        assert payload[1]["value"] == pytest.approx(100.0)
 
 
 def test_missing_journal_graceful():

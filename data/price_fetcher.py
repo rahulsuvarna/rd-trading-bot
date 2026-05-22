@@ -6,7 +6,6 @@ import pandas as pd
 import yfinance as yf
 
 from config.logger import get_logger
-from config.settings import DATA_PROVIDER
 from config.watchlist import INTERVAL, PERIOD
 from utils.ticker_utils import to_data_provider_symbol
 
@@ -20,7 +19,7 @@ def to_yahoo_symbol(ticker: str) -> str:
 
 def fetch_prices(ticker: str) -> pd.DataFrame | None:
     logger = get_logger(__name__)
-    provider_ticker = to_data_provider_symbol(ticker, DATA_PROVIDER)
+    provider_ticker = ticker  # caller is responsible for translation
 
     try:
         raw_df = yf.download(

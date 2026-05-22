@@ -87,6 +87,7 @@
                 <th class="py-2">Action</th>
                 <th class="py-2">Shares</th>
                 <th class="py-2">Price</th>
+                <th class="py-2">Amount</th>
                 <th class="py-2">P&amp;L</th>
               </tr>
             </thead>
@@ -98,10 +99,11 @@
                   <td class="py-2" :class="trade.action === 'BUY' ? 'text-emerald-300' : 'text-amber-300'" x-text="trade.action"></td>
                   <td class="py-2" x-text="Number(trade.shares || 0).toFixed(6)"></td>
                   <td class="py-2" x-text="formatGBP(trade.price)"></td>
+                  <td class="py-2" :class="trade.action === 'BUY' ? 'text-rose-300' : 'text-emerald-300'" x-text="formatGBP(trade.value || ((trade.shares || 0) * (trade.price || 0)))"></td>
                   <td class="py-2" :class="(trade.pnl || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="formatGBP(trade.pnl || 0)"></td>
                 </tr>
               </template>
-              <tr x-show="trades.length === 0"><td class="py-3 text-slate-500" colspan="6">No trades found</td></tr>
+              <tr x-show="trades.length === 0"><td class="py-3 text-slate-500" colspan="7">No trades found</td></tr>
             </tbody>
           </table>
         </div>

@@ -183,6 +183,12 @@ class TradingLoop:
 
             if not risk_decision["approved"]:
                 logger.info("%s: Risk gate blocked - %s", ticker, risk_decision["reason"])
+                enriched_signals[ticker] = {
+                    "signal": signal,
+                    "price": price,
+                    "executed": False,
+                    "reason": str(risk_decision.get("reason") or "blocked_by_risk_gate"),
+                }
                 continue
 
             approved_count += 1
@@ -198,6 +204,12 @@ class TradingLoop:
                 current_position = self.get_positions().get(ticker, 0.0)
                 if current_position <= 0:
                     logger.warning("%s: Cannot sell - no position held", ticker)
+                    enriched_signals[ticker] = {
+                        "signal": signal,
+                        "price": price,
+                        "executed": False,
+                        "reason": "no_position_held",
+                    }
                     continue
                 order_result = self.executor.execute_order(
                     ticker, "SELL", current_position, price
@@ -213,6 +225,7 @@ class TradingLoop:
                 "cost": order_result.get("cost"),
                 "proceeds": order_result.get("proceeds"),
                 "executed": order_result.get("executed", False),
+                "reason": order_result.get("reason"),
             }
 
             if order_result["executed"]:

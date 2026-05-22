@@ -82,6 +82,29 @@ def alert_cycle_summary(status: str, orders_executed: int) -> bool:
     return send_alert(message)
 
 
+def _format_reason(reason: object) -> str:
+    return str(reason).replace("_", " ")
+
+
+def _format_executed_line(ticker: str, signal: str, signal_payload: dict) -> str:
+    price = float(signal_payload.get("price", 0.0) or 0.0)
+    amount_value = signal_payload.get("cost")
+    if amount_value is None:
+        amount_value = signal_payload.get("proceeds", 0.0)
+    amount = float(amount_value or 0.0)
+
+    qty_text = ""
+    shares = signal_payload.get("shares")
+    if shares is not None:
+        try:
+            qty_text = f" | {float(shares):.4f} sh"
+        except (TypeError, ValueError):
+            qty_text = ""
+
+    price_text = f" @ £{price:.2f}" if price > 0 else ""
+    return f"{ticker} → {signal}{price_text} | £{amount:.2f}{qty_text} ✅"
+
+
 def _format_signal_line(ticker: str, signal_payload: object) -> str | None:
     if isinstance(signal_payload, str):
         if signal_payload.upper() == "HOLD":
@@ -92,23 +115,21 @@ def _format_signal_line(ticker: str, signal_payload: object) -> str | None:
         return None
 
     signal = str(signal_payload.get("signal", "")).upper() or "UNKNOWN"
-    executed = bool(signal_payload.get("executed", False))
-
-    if executed:
-        amount_value = signal_payload.get("cost")
-        if amount_value is None:
-            amount_value = signal_payload.get("proceeds", 0.0)
-        amount = float(amount_value or 0.0)
-        return f"{ticker} → {signal} £{amount:.2f} ✅"
+    if bool(signal_payload.get("executed", False)):
+        return _format_executed_line(ticker, signal, signal_payload)
 
     reason = signal_payload.get("reason")
     if reason:
-        return f"{ticker} → {signal} ❌ ({reason})"
+        return f"{ticker} → {signal} ❌ ({_format_reason(reason)})"
     return f"{ticker} → {signal} ❌"
 
 
 def alert_cycle_detail(cycle_result: dict) -> bool:
     timestamp = datetime.now().strftime("%H:%M")
+    status = str(cycle_result.get("status", "completed")).lower()
+    orders_executed = int(cycle_result.get("orders_executed", 0) or 0)
+    orders_approved = int(cycle_result.get("orders_approved", 0) or 0)
+    reason = cycle_result.get("reason")
     signals = cycle_result.get("signals", {})
     lines: list[str] = []
 
@@ -118,15 +139,19 @@ def alert_cycle_detail(cycle_result: dict) -> bool:
             if line:
                 lines.append(line)
 
-    if not lines:
-        return send_alert("😴 All signals HOLD — no trades this cycle")
-
     free_cash = float(cycle_result.get("free_cash", 0.0) or 0.0)
-    message = "\n".join(
-        [
-            f"📊 <b>Cycle complete</b> | {timestamp}",
-            *lines,
-            f"💰 Cash remaining: £{free_cash:.2f}",
-        ]
-    )
+    header = f"📊 <b>Cycle {status}</b> | {timestamp}"
+    stats = f"Approved: {orders_approved} | Executed: {orders_executed}"
+    summary_line = f"Reason: {_format_reason(reason)}" if reason else None
+
+    if not lines:
+        lines = ["😴 All signals HOLD - no trades this cycle"]
+
+    message_lines = [header, stats]
+    if summary_line:
+        message_lines.append(summary_line)
+
+    message_lines.extend(lines)
+    message_lines.append(f"💰 Cash remaining: £{free_cash:.2f}")
+    message = "\n".join(message_lines)
     return send_alert(message)

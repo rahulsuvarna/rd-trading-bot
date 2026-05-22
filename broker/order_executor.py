@@ -41,7 +41,7 @@ class OrderExecutor:
             return self.paper_account.get_cash()
 
         if self.live_client is None:
-            raise RuntimeError("Live client not provided for live mode")
+            raise RuntimeError(f"{self.mode.title()} client not provided")
         return self.live_client.get_cash()
 
     def get_positions(self) -> Dict[str, float]:
@@ -50,7 +50,7 @@ class OrderExecutor:
             return self.paper_account.get_positions()
 
         if self.live_client is None:
-            raise RuntimeError("Live client not provided for live mode")
+            raise RuntimeError(f"{self.mode.title()} client not provided")
         return self.live_client.get_positions()
 
     def execute_order(
@@ -76,7 +76,17 @@ class OrderExecutor:
                 return self.paper_account.execute_sell(ticker, amount, price)
             return {"executed": False, "reason": f"Unknown signal: {signal}"}
 
-        # Live mode - not implemented yet
+        if self.mode == "alpaca":
+            if self.live_client is None:
+                raise RuntimeError("Alpaca client not provided")
+            if signal.upper() == "BUY":
+                return self.live_client.execute_buy(ticker, amount)
+            if signal.upper() == "SELL":
+                # amount is shares for sell orders
+                return self.live_client.execute_sell(ticker, amount)
+            return {"executed": False, "reason": f"Unknown signal: {signal}"}
+
+        # T212 live mode - not yet implemented
         return {
             "executed": False,
             "mode": "live",

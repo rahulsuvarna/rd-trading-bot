@@ -14,9 +14,16 @@ TRADING212_API_KEY = os.getenv("TRADING212_API_KEY")
 TRADING212_API_SECRET = os.getenv("TRADING212_API_SECRET")
 TRADING212_ACCOUNT_TYPE = "ISA"  # Fixed for your use case
 
-# Alpaca API (for data - optional, falls back to yfinance)
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+
+# Broker execution backend
+BROKER = os.getenv("BROKER", "internal").lower()
+if BROKER not in ["internal", "alpaca"]:
+    raise ValueError(f"Invalid BROKER: {BROKER}. Must be 'internal' or 'alpaca'")
+if BROKER == "alpaca":
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        raise ValueError("ALPACA_API_KEY and ALPACA_SECRET_KEY required when BROKER=alpaca")
 
 # Telegram alerts
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -93,6 +100,7 @@ def get_startup_banner() -> str:
   Trading Bot
 {'='*60}
   Mode:           {TRADING_MODE.upper()}
+    Broker:         {BROKER.title()}
   Paper Cash:     £{PAPER_STARTING_CASH:.2f} (if paper mode)
     Data Source:    {DATA_PROVIDER.title()}
   Watchlist:      {len(WATCHLIST_SYMBOLS)} symbols
