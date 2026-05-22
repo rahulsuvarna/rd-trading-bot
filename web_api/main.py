@@ -17,7 +17,7 @@ from typing import Annotated, Generator, Iterable, Iterator
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 
 try:
     import resource
@@ -916,14 +916,11 @@ async def api_trades(
     request: Request,
     background_tasks: BackgroundTasks,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
-) -> StreamingResponse:
+) -> list[dict]:
     client, semaphore = _ensure_runtime_clients(request)
     state = await reconstruct_state(client, semaphore, max_trades=max(limit * 20, 1000), max_cycles=3000)
     background_tasks.add_task(_background_maintenance, len(state.cycles))
-    return StreamingResponse(
-        _iter_json_array_chunks(_iter_recent_trades(state, limit)),
-        media_type="application/json",
-    )
+    return list(_iter_recent_trades(state, limit))
 
 
 @app.get("/api/equity_history")
@@ -952,14 +949,11 @@ async def api_cycle_history(
     request: Request,
     background_tasks: BackgroundTasks,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
-) -> StreamingResponse:
+) -> list[dict]:
     client, semaphore = _ensure_runtime_clients(request)
     state = await reconstruct_state(client, semaphore, max_cycles=max(limit * 20, 2000), max_trades=1000)
     background_tasks.add_task(_background_maintenance, len(state.cycles))
-    return StreamingResponse(
-        _iter_json_array_chunks(_iter_recent_cycles(state, limit)),
-        media_type="application/json",
-    )
+    return list(_iter_recent_cycles(state, limit))
 
 
 @app.get("/api/debug/memory")
