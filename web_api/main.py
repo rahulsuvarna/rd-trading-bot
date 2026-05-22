@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Annotated, Generator, Iterable, Iterator
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -876,7 +876,7 @@ def index() -> FileResponse:
 
 
 @app.get("/api/state")
-async def api_state(request: Request, background_tasks: BackgroundTasks) -> dict:
+async def api_state(request: Request) -> dict:
     client, semaphore = _ensure_runtime_clients(request)
     state = await reconstruct_state(client, semaphore, max_trades=2000, max_cycles=5000)
     prices_result = _fetch_current_prices(client, semaphore, list(state.positions.keys()))
@@ -885,8 +885,6 @@ async def api_state(request: Request, background_tasks: BackgroundTasks) -> dict
     position_rows = _compute_position_rows(state, prices)
     market_value = sum((row["current_price"] * row["shares"]) for row in position_rows)
     unrealized = sum(row["pnl"] for row in position_rows)
-    background_tasks.add_task(_background_maintenance, len(state.cycles))
-
     return {
         "mode": state.mode,
         "cash": float(state.cash),
@@ -901,30 +899,27 @@ async def api_state(request: Request, background_tasks: BackgroundTasks) -> dict
 
 
 @app.get("/api/positions")
-async def api_positions(request: Request, background_tasks: BackgroundTasks) -> list[dict]:
+async def api_positions(request: Request) -> list[dict]:
     client, semaphore = _ensure_runtime_clients(request)
     state = await reconstruct_state(client, semaphore, max_cycles=2000)
     prices_result = _fetch_current_prices(client, semaphore, list(state.positions.keys()))
     prices = await _await_if_needed(prices_result)
     prices = prices if isinstance(prices, dict) else {}
-    background_tasks.add_task(_background_maintenance, len(state.cycles))
     return _compute_position_rows(state, prices)
 
 
 @app.get("/api/trades")
 async def api_trades(
     request: Request,
-    background_tasks: BackgroundTasks,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
 ) -> list[dict]:
     client, semaphore = _ensure_runtime_clients(request)
     state = await reconstruct_state(client, semaphore, max_trades=max(limit * 20, 1000), max_cycles=3000)
-    background_tasks.add_task(_background_maintenance, len(state.cycles))
     return list(_iter_recent_trades(state, limit))
 
 
 @app.get("/api/equity_history")
-async def api_equity_history(request: Request, background_tasks: BackgroundTasks) -> dict:
+async def api_equity_history(request: Request) -> dict:
     client, semaphore = _ensure_runtime_clients(request)
     state = await reconstruct_state(client, semaphore, max_cycles=10000)
     cycles = state.cycles
@@ -939,20 +934,16 @@ async def api_equity_history(request: Request, background_tasks: BackgroundTasks
     filtered = filtered[-100:]
     timestamps = [c["timestamp"] for c in filtered]
     values = [float(c.get("free_cash", 0.0)) for c in filtered]
-    background_tasks.add_task(_background_maintenance, len(state.cycles))
-
     return {"timestamps": timestamps, "values": values}
 
 
 @app.get("/api/cycle_history")
 async def api_cycle_history(
     request: Request,
-    background_tasks: BackgroundTasks,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
 ) -> list[dict]:
     client, semaphore = _ensure_runtime_clients(request)
     state = await reconstruct_state(client, semaphore, max_cycles=max(limit * 20, 2000), max_trades=1000)
-    background_tasks.add_task(_background_maintenance, len(state.cycles))
     return list(_iter_recent_cycles(state, limit))
 
 
