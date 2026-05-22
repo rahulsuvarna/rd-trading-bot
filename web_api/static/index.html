@@ -8,7 +8,7 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen" x-data="dashboardApp()" x-init="init()">
+<body class="bg-slate-950 text-slate-100 min-h-screen" x-data="dashboardApp()">
   <div class="max-w-7xl mx-auto px-4 py-6">
     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6">
       <h1 class="text-2xl font-bold tracking-tight">Trading Bot Dashboard</h1>
@@ -163,7 +163,11 @@
           this.trades = trades || [];
           this.cycleHistory = cycleHistory || [];
           this.computeWinRate();
-          this.renderChart(equity || { timestamps: [], values: [] });
+          try {
+            this.renderChart(equity || { timestamps: [], values: [] });
+          } catch (error) {
+            console.warn('Equity chart render failed:', error);
+          }
         },
 
         computeWinRate() {
@@ -184,13 +188,25 @@
           const values = equity.values || [];
 
           if (this.chart) {
+            try {
+              this.chart.destroy();
+            } catch (error) {
+              console.warn('Equity chart destroy failed:', error);
+            }
+            this.chart = null;
+          }
+
+          const canvasContext = ctx.getContext('2d');
+          if (!canvasContext) return;
+
+          if (this.chart) {
             this.chart.data.labels = labels;
             this.chart.data.datasets[0].data = values;
             this.chart.update();
             return;
           }
 
-          this.chart = new Chart(ctx, {
+          this.chart = new Chart(canvasContext, {
             type: 'line',
             data: {
               labels,
